@@ -22,9 +22,9 @@ TOKEN = ""
 # Максимальная длина сообщения в Telegram
 MAX_MESSAGE_LENGTH = 4000  # Оставляем небольшой запас от лимита в 4096
 
-# Состояния для ConversationHandler
-WAITING_FOR_GPT_PROMPT = 1
-WAITING_FOR_IMAGE_PROMPT = 2
+# Режимы работы бота
+MODE_TEXT = "text"
+MODE_IMAGE = "image"
 
 # Инициализация g4f провайдеров
 g4f.debug.logging = False  # Отключить дебаг логи
@@ -59,6 +59,8 @@ except:
 
 # История сообщений для каждого пользователя
 user_history = {}
+# Режим работы для каждого пользователя (по умолчанию - текст)
+user_mode = {}
 
 def start(update: Update, context: CallbackContext) -> None:
     """Обработчик команды /start"""
@@ -67,10 +69,12 @@ def start(update: Update, context: CallbackContext) -> None:
     
     # Инициализируем историю пользователя без системного сообщения о разметке
     user_history[user_id] = []
+    # Устанавливаем режим по умолчанию - текст
+    user_mode[user_id] = MODE_TEXT
     
     # Создаем клавиатуру с основными командами
     keyboard = [
-        [KeyboardButton("🤖 GPT"), KeyboardButton("🖼 Изображение")]
+        [KeyboardButton("🤖 GPT"), KeyboardButton("🎨 Изображение")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -80,9 +84,8 @@ def start(update: Update, context: CallbackContext) -> None:
         f'Текущие настройки:\n'
         f'- Текстовые ответы: gpt-4o-mini\n'
         f'- Генерация изображений: flux\n\n'
-        f'Команды:\n'
-        f'/gpt <сообщение> - Получить ответ от GPT\n'
-        f'/image <описание> - Сгенерировать изображение',
+        f'Нажмите кнопку "🤖 GPT" для генерации текста или "🎨 Изображение" для генерации картинок.\n'
+        f'Текущий режим: Генерация текста',
         reply_markup=reply_markup
     )
 
@@ -98,9 +101,11 @@ def get_gpt_response(prompt, model=text_model, history=None):
         try:
             # Пробуем использовать клиент API
             client = Client()
+            # Используем stream=False для получения полного ответа сразу
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
+                stream=False,  # Явно указываем, что не хотим стриминг
             )
             response_text = response.choices[0].message.content
         except Exception as client_error:
@@ -109,7 +114,7 @@ def get_gpt_response(prompt, model=text_model, history=None):
             response_text = g4f.ChatCompletion.create(
                 model=model,
                 messages=messages,
-                stream=False,
+                stream=False,  # Явно указываем, что не хотим стриминг
             )
         
         return response_text, {"role": "assistant", "content": response_text}
@@ -130,7 +135,9 @@ def generate_image(prompt):
         response = client.images.generate(
             model="flux",
             prompt=prompt,
-            response_format="url"
+            response_format="url",
+            width=1280,
+            height=1280
         )
         
         # Получаем URL изображения
@@ -156,135 +163,86 @@ def handle_message(update: Update, context: CallbackContext) -> None:
     
     # Обработка кнопок меню
     if prompt == "🤖 GPT":
-        # Запрашиваем у пользователя ввод для GPT
+        # Переключаем режим на генерацию текста
+        user_mode[user_id] = MODE_TEXT
         update.message.reply_text(
-            "Введите ваш запрос для GPT:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="cancel")]
-            ])
+            "Режим переключен на генерацию текста. Теперь все ваши сообщения будут обрабатываться как запросы к GPT."
         )
-        return WAITING_FOR_GPT_PROMPT
+        return
     
-    elif prompt == "🖼 Изображение":
-        # Запрашиваем у пользователя описание изображения
+    elif prompt == "🎨 Изображение":
+        # Переключаем режим на генерацию изображений
+        user_mode[user_id] = MODE_IMAGE
         update.message.reply_text(
-            "Введите описание изображения, которое хотите сгенерировать:",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="cancel")]
-            ])
+            "Режим переключен на генерацию изображений. Теперь все ваши сообщения будут обрабатываться как запросы на создание изображений."
         )
-        return WAITING_FOR_IMAGE_PROMPT
+        return
     
     # Инициализация истории пользователя, если её нет
     if user_id not in user_history:
         user_history[user_id] = []
     
-    # Отправка "печатает..."
-    context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    # Если пользователь не имеет режима, устанавливаем по умолчанию
+    if user_id not in user_mode:
+        user_mode[user_id] = MODE_TEXT
     
-    # Получение ответа от GPT
-    response, assistant_message = get_gpt_response(prompt, history=user_history[user_id])
-    
-    # Добавление сообщений в историю
-    user_history[user_id].append({"role": "user", "content": prompt})
-    if assistant_message:
-        user_history[user_id].append(assistant_message)
-    
-    # Разбиваем длинное сообщение на части и отправляем
-    message_parts = split_long_message(response)
-    for i, part in enumerate(message_parts):
-        try:
-            # Добавляем индикатор части для длинных сообщений
-            if len(message_parts) > 1:
-                part_indicator = f"[Часть {i+1}/{len(message_parts)}]\n"
-                if i > 0:  # Для всех частей, кроме первой, добавляем индикатор в начало
-                    part = part_indicator + part
-                else:  # Для первой части добавляем индикатор только если он поместится
-                    if len(part) + len(part_indicator) <= MAX_MESSAGE_LENGTH:
+    # Обработка сообщения в зависимости от текущего режима
+    if user_mode[user_id] == MODE_TEXT:
+        # Режим генерации текста
+        # Отправка "печатает..."
+        context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        
+        # Получение ответа от GPT
+        response, assistant_message = get_gpt_response(prompt, history=user_history[user_id])
+        
+        # Добавление сообщений в историю
+        user_history[user_id].append({"role": "user", "content": prompt})
+        if assistant_message:
+            user_history[user_id].append(assistant_message)
+        
+        # Разбиваем длинное сообщение на части и отправляем
+        message_parts = split_long_message(response)
+        for i, part in enumerate(message_parts):
+            try:
+                # Добавляем индикатор части для длинных сообщений
+                if len(message_parts) > 1:
+                    part_indicator = f"[Часть {i+1}/{len(message_parts)}]\n"
+                    if i > 0:  # Для всех частей, кроме первой, добавляем индикатор в начало
                         part = part_indicator + part
+                    else:  # Для первой части добавляем индикатор только если он поместится
+                        if len(part) + len(part_indicator) <= MAX_MESSAGE_LENGTH:
+                            part = part_indicator + part
+                
+                update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                # Если не удалось отправить с Markdown, пробуем без форматирования
+                logger.warning(f"Ошибка при отправке с Markdown: {e}")
+                update.message.reply_text(part)
+    
+    elif user_mode[user_id] == MODE_IMAGE:
+        # Режим генерации изображений
+        # Отправка "отправляет фото..."
+        context.bot.send_chat_action(chat_id=update.effective_chat.id, action='upload_photo')
+        
+        # Генерация изображения
+        img_data = generate_image(prompt)
+        
+        if img_data:
+            # Отправка изображения
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+                tmp_file.write(img_data)
+                tmp_file_path = tmp_file.name
             
-            update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            # Если не удалось отправить с Markdown, пробуем без форматирования
-            logger.warning(f"Ошибка при отправке с Markdown: {e}")
-            update.message.reply_text(part)
-    
-    return ConversationHandler.END
-
-def handle_gpt_prompt(update: Update, context: CallbackContext) -> int:
-    """Обработчик ввода запроса для GPT после нажатия кнопки GPT"""
-    user_id = update.effective_user.id
-    prompt = update.message.text
-    
-    # Инициализация истории пользователя, если её нет
-    if user_id not in user_history:
-        user_history[user_id] = []
-    
-    # Отправка "печатает..."
-    context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    
-    # Получение ответа от GPT
-    response, assistant_message = get_gpt_response(prompt, history=user_history[user_id])
-    
-    # Добавление сообщений в историю
-    user_history[user_id].append({"role": "user", "content": prompt})
-    if assistant_message:
-        user_history[user_id].append(assistant_message)
-    
-    # Разбиваем длинное сообщение на части и отправляем
-    message_parts = split_long_message(response)
-    for i, part in enumerate(message_parts):
-        try:
-            # Добавляем индикатор части для длинных сообщений
-            if len(message_parts) > 1:
-                part_indicator = f"[Часть {i+1}/{len(message_parts)}]\n"
-                if i > 0:  # Для всех частей, кроме первой, добавляем индикатор в начало
-                    part = part_indicator + part
-                else:  # Для первой части добавляем индикатор только если он поместится
-                    if len(part) + len(part_indicator) <= MAX_MESSAGE_LENGTH:
-                        part = part_indicator + part
+            with open(tmp_file_path, 'rb') as f:
+                update.message.reply_photo(
+                    photo=f, 
+                    caption=f"Сгенерировано по запросу: {prompt}"
+                )
             
-            update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            # Если не удалось отправить с Markdown, пробуем без форматирования
-            logger.warning(f"Ошибка при отправке с Markdown: {e}")
-            update.message.reply_text(part)
-    
-    return ConversationHandler.END
-
-def handle_image_prompt(update: Update, context: CallbackContext) -> int:
-    """Обработчик ввода описания изображения после нажатия кнопки Изображение"""
-    prompt = update.message.text
-    
-    # Отправка "отправляет фото..."
-    context.bot.send_chat_action(chat_id=update.effective_chat.id, action='upload_photo')
-    
-    # Генерация изображения
-    img_data = generate_image(prompt)
-    
-    if img_data:
-        # Отправка изображения
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
-            tmp_file.write(img_data)
-            tmp_file_path = tmp_file.name
-        
-        with open(tmp_file_path, 'rb') as f:
-            update.message.reply_photo(
-                photo=f, 
-                caption=f"Сгенерировано по запросу: {prompt}"
-            )
-        
-        # Удаление временного файла
-        os.unlink(tmp_file_path)
-        
-        # Убираем очистку истории пользователя после генерации изображения
-        # user_id = update.effective_user.id
-        # if user_id in user_history:
-        #     user_history[user_id] = []
-    else:
-        update.message.reply_text('Не удалось сгенерировать изображение. Попробуйте другой запрос.')
-    
-    return ConversationHandler.END
+            # Удаление временного файла
+            os.unlink(tmp_file_path)
+        else:
+            update.message.reply_text('Не удалось сгенерировать изображение. Попробуйте другой запрос.')
 
 def cancel(update: Update, context: CallbackContext) -> int:
     """Отмена текущего диалога"""
@@ -365,11 +323,6 @@ def handle_image_command(update: Update, context: CallbackContext) -> None:
         
         # Удаление временного файла
         os.unlink(tmp_file_path)
-        
-        # Убираем очистку истории пользователя после генерации изображения
-        # user_id = update.effective_user.id
-        # if user_id in user_history:
-        #     user_history[user_id] = []
     else:
         update.message.reply_text('Не удалось сгенерировать изображение. Попробуйте другой запрос.')
 
@@ -423,23 +376,13 @@ def main() -> None:
     # Получение диспетчера для регистрации обработчиков
     dispatcher = updater.dispatcher
 
-    # Создаем обработчик разговора для кнопок меню
-    conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(Filters.text & ~Filters.command, handle_message)],
-        states={
-            WAITING_FOR_GPT_PROMPT: [MessageHandler(Filters.text & ~Filters.command, handle_gpt_prompt)],
-            WAITING_FOR_IMAGE_PROMPT: [MessageHandler(Filters.text & ~Filters.command, handle_image_prompt)],
-        },
-        fallbacks=[CallbackQueryHandler(cancel, pattern='^cancel$')],
-    )
-    
     # Регистрация обработчиков команд
     dispatcher.add_handler(CommandHandler("start", start))
     dispatcher.add_handler(CommandHandler("gpt", handle_gpt_command))
     dispatcher.add_handler(CommandHandler("image", handle_image_command))
     
-    # Регистрация обработчика разговора
-    dispatcher.add_handler(conv_handler)
+    # Регистрация обработчика обычных сообщений
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     
     # Регистрация обработчика callback-запросов для кнопок
     dispatcher.add_handler(CallbackQueryHandler(cancel))
