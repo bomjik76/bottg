@@ -1,0 +1,4 @@
+python-telegram-bot==13.15
+requests==2.31.0
+g4f==0.1.9.8
+pillow==10.1.0 
