@@ -98,24 +98,173 @@ def get_gpt_response(prompt, model=text_model, history=None):
         
         messages.append({"role": "user", "content": prompt})
         
+        # Флаг для отслеживания, получили ли мы потоковый ответ
+        received_streaming_response = False
+        
         try:
             # Пробуем использовать клиент API
             client = Client()
-            # Используем stream=False для получения полного ответа сразу
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=False,  # Явно указываем, что не хотим стриминг
-            )
-            response_text = response.choices[0].message.content
+            
+            try:
+                # Сначала пробуем получить полный ответ без стриминга
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=False,  # Явно указываем, что не хотим стриминг
+                )
+                
+                # Проверяем, не является ли ответ потоковым, несмотря на наши настройки
+                if hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
+                    response_text = response.choices[0].message.content
+                else:
+                    # Если ответ все-таки потоковый, собираем его вручную
+                    logger.warning("Получен потоковый ответ, несмотря на stream=False")
+                    received_streaming_response = True
+                    full_response = ""
+                    
+                    # Если response - это генератор или итератор
+                    if hasattr(response, '__iter__') or hasattr(response, '__next__'):
+                        for chunk in response:
+                            if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                                if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+                                    content = chunk.choices[0].delta.content
+                                    if content:
+                                        full_response += content
+                                elif hasattr(chunk.choices[0], 'message') and hasattr(chunk.choices[0].message, 'content'):
+                                    content = chunk.choices[0].message.content
+                                    if content:
+                                        full_response += content
+                    
+                    response_text = full_response if full_response else "Не удалось получить ответ от модели."
+            
+            except Exception as stream_error:
+                # Если произошла ошибка при попытке получить ответ без стриминга,
+                # попробуем явно использовать стриминг и собрать ответ вручную
+                logger.warning(f"Ошибка при получении ответа без стриминга: {stream_error}. Пробуем со стримингом.")
+                received_streaming_response = True
+                
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,  # Явно запрашиваем стриминг
+                )
+                
+                full_response = ""
+                for chunk in response:
+                    if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                        if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+                            content = chunk.choices[0].delta.content
+                            if content:
+                                full_response += content
+                
+                response_text = full_response if full_response else "Не удалось получить ответ от модели."
+                
         except Exception as client_error:
             logger.warning(f"Ошибка при использовании клиента: {client_error}")
             # Если клиент не работает, используем старый метод
-            response_text = g4f.ChatCompletion.create(
-                model=model,
-                messages=messages,
-                stream=False,  # Явно указываем, что не хотим стриминг
-            )
+            try:
+                # Пробуем сначала без стриминга
+                response_text = g4f.ChatCompletion.create(
+                    model=model,
+                    messages=messages,
+                    stream=False,
+                )
+                
+                # Проверяем, не является ли ответ потоковым или словарем с данными
+                if isinstance(response_text, (list, tuple, set)) or hasattr(response_text, '__iter__') or isinstance(response_text, dict):
+                    logger.warning("g4f.ChatCompletion вернул не строку. Обрабатываем специальным образом.")
+                    received_streaming_response = True
+                    
+                    full_response = ""
+                    
+                    # Если это итерируемый объект
+                    if hasattr(response_text, '__iter__') and not isinstance(response_text, (str, dict)):
+                        for chunk in response_text:
+                            if isinstance(chunk, str):
+                                full_response += chunk
+                            elif isinstance(chunk, dict) and 'content' in chunk:
+                                full_response += chunk['content']
+                    # Если это словарь
+                    elif isinstance(response_text, dict):
+                        if 'content' in response_text:
+                            full_response = response_text['content']
+                        elif 'message' in response_text and 'content' in response_text['message']:
+                            full_response = response_text['message']['content']
+                    
+                    response_text = full_response if full_response else "Не удалось получить ответ от модели."
+                
+                # Если ответ содержит "data: {" - это признак потокового ответа в текстовом формате
+                elif isinstance(response_text, str) and "data: {" in response_text:
+                    logger.warning("Обнаружен потоковый ответ в текстовом формате")
+                    received_streaming_response = True
+                    
+                    # Извлекаем содержимое из строк вида "data: {"content":"текст"}"
+                    full_response = ""
+                    for line in response_text.split('\n'):
+                        if line.startswith('data: {'):
+                            try:
+                                # Пытаемся извлечь JSON из строки
+                                import json
+                                data_str = line.replace('data: ', '')
+                                data = json.loads(data_str)
+                                if 'content' in data and data['content']:
+                                    full_response += data['content']
+                            except Exception as json_error:
+                                logger.error(f"Ошибка при разборе JSON из потокового ответа: {json_error}")
+                    
+                    response_text = full_response if full_response else "Не удалось получить ответ от модели."
+                
+            except Exception as g4f_error:
+                logger.error(f"Ошибка при использовании g4f.ChatCompletion: {g4f_error}")
+                
+                # Последняя попытка - явно запросить стриминг и собрать ответ
+                try:
+                    logger.info("Пробуем явно запросить стриминг через g4f.ChatCompletion")
+                    received_streaming_response = True
+                    
+                    response_stream = g4f.ChatCompletion.create(
+                        model=model,
+                        messages=messages,
+                        stream=True,
+                    )
+                    
+                    full_response = ""
+                    for chunk in response_stream:
+                        if isinstance(chunk, str):
+                            full_response += chunk
+                        elif isinstance(chunk, dict) and 'content' in chunk:
+                            full_response += chunk['content']
+                    
+                    response_text = full_response if full_response else "Не удалось получить ответ от модели."
+                except Exception as stream_error:
+                    logger.error(f"Ошибка при использовании стриминга через g4f.ChatCompletion: {stream_error}")
+                    response_text = f"Произошла ошибка при получении ответа: {str(g4f_error)}"
+        
+        # Финальная проверка на потоковый формат в текстовом ответе
+        if isinstance(response_text, str) and "data: {" in response_text:
+            logger.warning("Финальная проверка: обнаружен потоковый ответ в текстовом формате")
+            received_streaming_response = True
+            
+            # Извлекаем содержимое из строк вида "data: {"content":"текст"}"
+            full_response = ""
+            for line in response_text.split('\n'):
+                if line.startswith('data: {'):
+                    try:
+                        # Пытаемся извлечь JSON из строки
+                        import json
+                        data_str = line.replace('data: ', '')
+                        data = json.loads(data_str)
+                        if 'content' in data and data['content']:
+                            full_response += data['content']
+                    except Exception as json_error:
+                        logger.error(f"Ошибка при разборе JSON из потокового ответа: {json_error}")
+            
+            if full_response:
+                response_text = full_response
+        
+        # Логируем информацию о типе полученного ответа
+        if received_streaming_response:
+            logger.info("Был получен и обработан потоковый ответ")
         
         return response_text, {"role": "assistant", "content": response_text}
     except Exception as e:
@@ -131,29 +280,83 @@ def generate_image(prompt):
         # Создаем клиент
         client = Client()
         
-        # Генерируем изображение
-        response = client.images.generate(
-            model="flux",
-            prompt=prompt,
-            response_format="url",
-            width=1280,
-            height=1280
-        )
-        
-        # Получаем URL изображения
-        if response and hasattr(response, 'data') and len(response.data) > 0:
-            image_url = response.data[0].url
-            logger.info(f"Получен URL изображения: {image_url}")
+        try:
+            # Генерируем изображение
+            response = client.images.generate(
+                model="flux",
+                prompt=prompt,
+                response_format="url",
+                width=1024,  # Уменьшаем размер для большей надежности
+                height=1024
+            )
             
-            # Загружаем изображение
-            img_response = requests.get(image_url, timeout=60)
+            # Получаем URL изображения
+            if response and hasattr(response, 'data') and len(response.data) > 0:
+                image_url = response.data[0].url
+                logger.info(f"Получен URL изображения: {image_url}")
+                
+                # Загружаем изображение
+                img_response = requests.get(image_url, timeout=60)
+                
+                if img_response.status_code == 200:
+                    # Проверяем, что полученные данные - действительно изображение
+                    try:
+                        img = Image.open(BytesIO(img_response.content))
+                        # Преобразуем изображение в JPEG для гарантии совместимости с Telegram
+                        buffer = BytesIO()
+                        img.convert('RGB').save(buffer, format='JPEG')
+                        buffer.seek(0)
+                        
+                        return buffer.getvalue()
+                    except Exception as img_error:
+                        logger.error(f"Ошибка при обработке изображения: {img_error}")
+                        return None
+                else:
+                    logger.error(f"Ошибка при загрузке изображения: {img_response.status_code}")
+                    return None
+            else:
+                logger.error("Не удалось получить URL изображения из ответа API")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Ошибка при генерации изображения через client.images.generate: {e}")
             
-            # Возвращаем содержимое изображения
-            return img_response.content
-        
-        return None
+            # Пробуем альтернативный метод
+            try:
+                logger.info("Пробуем альтернативный метод g4f.images.create")
+                img_url = g4f.images.create(
+                    prompt=prompt,
+                    model="flux"
+                )
+                
+                if img_url:
+                    img_response = requests.get(img_url, timeout=60)
+                    
+                    if img_response.status_code == 200:
+                        # Проверяем, что полученные данные - действительно изображение
+                        try:
+                            img = Image.open(BytesIO(img_response.content))
+                            # Преобразуем изображение в JPEG
+                            buffer = BytesIO()
+                            img.convert('RGB').save(buffer, format='JPEG')
+                            buffer.seek(0)
+                            
+                            return buffer.getvalue()
+                        except Exception as img_error:
+                            logger.error(f"Ошибка при обработке изображения: {img_error}")
+                            return None
+                    else:
+                        logger.error(f"Ошибка при загрузке изображения: {img_response.status_code}")
+                        return None
+                else:
+                    logger.error("Не удалось получить URL изображения из g4f.images.create")
+                    return None
+            except Exception as alt_error:
+                logger.error(f"Ошибка при использовании альтернативного метода: {alt_error}")
+                return None
+                
     except Exception as e:
-        logger.error(f"Ошибка при генерации изображения: {e}")
+        logger.error(f"Общая ошибка при генерации изображения: {e}")
         return None
 
 def handle_message(update: Update, context: CallbackContext) -> None:
@@ -380,6 +583,8 @@ def main() -> None:
     dispatcher.add_handler(CommandHandler("start", start))
     dispatcher.add_handler(CommandHandler("gpt", handle_gpt_command))
     dispatcher.add_handler(CommandHandler("image", handle_image_command))
+    dispatcher.add_handler(CommandHandler("clear", clear_history))
+    dispatcher.add_handler(CommandHandler("models", list_models))
     
     # Регистрация обработчика обычных сообщений
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
